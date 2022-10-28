@@ -1,1 +1,0 @@
-## Matlab Gauss-Jackson Integrator
