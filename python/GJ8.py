@@ -14,7 +14,9 @@ GM = 398600.4415  # parameter mu = graviational constant * mass of Earth (km^3 /
 np.set_printoptions(precision=16)  # for high precision debugging
 
 
-# FIXME: currently 30x worse error and 8x slower than matlab
+# FIXME: 
+# Matlab error after 1 orbit = 30 nm    (target)
+# Python error after 1 orbit = 1500 nm  (too big)
 def gauss_jackson_8(ode_sys: callable, y_0: np.ndarray, dy_0: np.ndarray,
         t_range: np.ndarray, dt: float, conv_max_iter: int = 10,
         rel_tol: float = 1e-13, abs_tol: float = 1e-15) -> tuple[np.ndarray]:
@@ -195,7 +197,7 @@ def gauss_jackson_8(ode_sys: callable, y_0: np.ndarray, dy_0: np.ndarray,
     i = 8  # corresponding index in our arrays
 
     # initialise large arrays to zeroes
-    num_steps = round((t_stop - t_start) / dt)
+    num_steps = round(np.ceil((t_stop - t_start) / dt))
     extra_zeroes = np.zeros((num_steps - 4, 3))
     y = np.vstack((y, extra_zeroes))           # y_n = y[i]
     dy = np.vstack((dy, extra_zeroes))         # dy_n = dy[i]
@@ -320,6 +322,7 @@ def calculate_kepler_orbit(r_0: np.ndarray, v_0: np.ndarray, t_vec: np.ndarray) 
     tuple[np.ndarray]: the orbit solution (r, v, a) as arrays (rows representing time in `t_vec`)
     '''    
 
+    # Method theory from
     # https://kyleniemeyer.github.io/space-systems-notes/orbital-mechanics/two-body-problems.html
 
     v_r0 = v_0.dot(r_0) / norm(r_0)                 # initial radial speed
@@ -331,36 +334,40 @@ def calculate_kepler_orbit(r_0: np.ndarray, v_0: np.ndarray, t_vec: np.ndarray) 
     v_calc = np.reshape(np.zeros_like(t_vec), (t_vec.shape[0], 1)) * np.zeros_like(v_0)
     a_calc = np.reshape(np.zeros_like(t_vec), (t_vec.shape[0], 1)) * np.zeros_like(v_0)
 
-    # Stumpff functions
+    # Stumpff functions: https://www.johndcook.com/blog/2021/08/14/s-and-c-functions/
     C = lambda z: (1 - np.cos(np.sqrt(z))) / z if z > 0 else \
         ((1 - np.cosh(np.sqrt(-z))) / z if z < 0 else 1/2)
     S = lambda z: ((p := np.sqrt(z)) - np.sin(p)) / p ** 3 if z > 0 else \
         ((np.sinh((p := np.sqrt(-z))) - p) / p ** 3 if z < 0 else 1/6)
+
     # derivatives of C(z) and S(z)
     dCdz = lambda z: 1 / (2 * z) * (1 - 2 * C(z) - z * S(z))
     dSdz = lambda z: 1 / (2 * z) * (C(z) - 3 * S(z))
 
     for i, dt in enumerate(t_vec):
-        CHI_0 = np.sqrt(GM) / np.abs(a) * dt  # Chobotov approximation of universal anomaly CHI
+        chi_0 = np.sqrt(GM) * alpha * dt  # Chobotov approximation of universal anomaly chi
         
         # universal Kepler equation
-        F_chi = lambda x: np.sqrt(GM) * dt - (r_0m * v_r0) / np.sqrt(GM) * x ** 2 * C(alpha * x ** 2) \
-            - (1 - alpha * r_0m) * x ** 3 * S(alpha * x ** 2) - r_0m * x
+        F_chi = lambda x: np.sqrt(GM) * dt - (r_0m * v_r0) / np.sqrt(GM) * x ** 2 * \
+            C((ax2 := alpha * x ** 2)) - (1 - alpha * r_0m) * x ** 3 * S(ax2) - r_0m * x
 
         # derivative of F_chi wrt chi
-        dF_chi = lambda x: -(2 * (r_0m * v_r0) / np.sqrt(GM) * x * C(alpha * x ** 2) + \
-            (r_0m * v_r0) / np.sqrt(GM) * x ** 2 * 2 * alpha * x * dCdz(alpha * x ** 2)) - \
-            (3 * x ** 2 * (1 - alpha * r_0m) * S(alpha * x ** 2) + \
-            (1 - alpha * r_0m) * x ** 3 * 2 * alpha * x * dSdz(alpha * x ** 2)) - r_0m
+        dF_chi = lambda x: -(2 * (r_0m * v_r0) / np.sqrt(GM) * x * C((ax2 := alpha * x ** 2)) + \
+            (r_0m * v_r0) / np.sqrt(GM) * x ** 2 * 2 * alpha * x * dCdz(ax2)) - \
+            (3 * x ** 2 * (1 - alpha * r_0m) * S(ax2) + \
+            (1 - alpha * r_0m) * x ** 3 * 2 * alpha * x * dSdz(ax2)) - r_0m
 
-        CHI = root_scalar(F_chi, x0=CHI_0, fprime=dF_chi, method='newton', xtol=1e-15, rtol=1e-13).root
+        # solve universal Kepler equation
+        chi = root_scalar(F_chi, x0=chi_0, fprime=dF_chi, method='newton', xtol=1e-13, rtol=1e-15).root
 
-        f = 1 - CHI ** 2 / r_0m * C(alpha * CHI ** 2)               # Lagrange coefficients
-        g = dt - (GM) ** (-1/2) * CHI ** 3 * S(alpha * CHI ** 2)
+        # convert to velocity coordinates
+        ax2 = alpha * chi ** 2
+        f = 1 - chi ** 2 / r_0m * C(ax2)               # Lagrange coefficients
+        g = dt - (GM) ** (-1/2) * chi ** 3 * S(ax2)
         r_calc[i] = f * r_0 + g * v_0
         r_m = norm(r_calc[i])
-        f_dot = np.sqrt(GM) / (r_m * r_0m) * (alpha * CHI ** 3 * S(alpha * CHI ** 2) - CHI)
-        g_dot = 1 - CHI ** 2 / r_m * C(alpha * CHI ** 2)
+        f_dot = np.sqrt(GM) / (r_m * r_0m) * (alpha * chi ** 3 * S(ax2) - chi)
+        g_dot = 1 - chi ** 2 / r_m * C(ax2)
         v_calc[i] = f_dot * r_0 + g_dot * v_0
     
     a_calc = -GM / norm(r_calc) ** 3 * r_calc
@@ -368,7 +375,7 @@ def calculate_kepler_orbit(r_0: np.ndarray, v_0: np.ndarray, t_vec: np.ndarray) 
     return r_calc, v_calc, a_calc
 
 
-if __name__ == '__main__':
+def main():
 
     # stylesheet
     plt.style.use(r'C:\Users\lnick\Documents\Personal\Programming\Python\Resources\proplot_style.mplstyle')
@@ -379,44 +386,53 @@ if __name__ == '__main__':
 
     # calculate trajectory using GJ8
     print('Calculating trajectory using GJ8...')
-    t, r, *_ = gauss_jackson_8(orbital_dynamics,
-        np.array([R_0, 0, 0]), np.array([0, V_0, 0]), (0, 8640000 / 2), 60)
+    t, y, dy, ddy = gauss_jackson_8(orbital_dynamics,
+        np.array([R_0, 0, 0]), np.array([0, V_0, 0]), (0, 5829), 60)
 
     # calculate circular orbit position
     print('Calculating trajectory using circular motion...')
     W = norm(V_0) / norm(R_0)
     r_circle = np.array([[R_0 * np.cos(W * t_i), R_0 * np.sin(W * t_i), 0] for t_i in t])
-    errors_circle = [1e6 * np.hypot(r_circle[i, 0] - r[i, 0], r_circle[i, 1] - r[i, 1]) \
-        for i in range(len(r))]
+    errors_circle = [1e6 * np.hypot(r_circle[i, 0] - y[i, 0], r_circle[i, 1] - y[i, 1]) \
+        for i in range(len(y))]
 
     # calculate orbit with Kepler's equation
     print('Calculating trajectory using Kepler equation...')
     r_kepler, _v_k, _a_k = calculate_kepler_orbit(np.array([R_0, 0, 0]), np.array([0, V_0, 0]), t)
-    errors_kepler = [1e6 * np.hypot(r_kepler[i, 0] - r[i, 0], r_kepler[i, 1] - r[i, 1]) \
-        for i in range(len(r))]
+    errors_kepler = [1e6 * np.hypot(r_kepler[i, 0] - y[i, 0], r_kepler[i, 1] - y[i, 1]) \
+        for i in range(len(y))]
 
     # check kepler actually works (it does, to < 1 micron)
     kepler_vs_circle = [1e6 * np.hypot(r_kepler[i, 0] - r_circle[i, 0], r_kepler[i, 1] - r_circle[i, 1]) \
-        for i in range(len(r))]
-
+        for i in range(len(t))]
 
     # plots
     print('Plotting graphs...')
     fig, axs = plt.subplots(1, 3, figsize=(12, 4))
     fig.suptitle('Gauss-Jackson Orbit Propogation Results')
     fig.tight_layout(pad=3)
-    axs[0].plot(t / 60, r[:, 0], label='$ x(t) $')  # x(t)
-    axs[0].plot(t / 60, r[:, 1], label='$ y(t) $')  # y(t)
+
+    # GJ8 calculated x and y
+    axs[0].plot(t / 60, y[:, 0], label='$ x(t) $')  # x(t)
+    axs[0].plot(t / 60, y[:, 1], label='$ y(t) $')  # y(t)
     axs[0].set_xlabel('Time, $ t $ (min)')
     axs[0].set_ylabel('Position, $ \mathbf{r} $ (km)')
     axs[0].set_title('Position components')
-    axs[1].plot(r[:, 0], r[:, 1], label='calculated')  # phase / state space
+
+    # GJ8 calculated trajectory
+    axs[1].plot(y[:, 0], y[:, 1], label='calculated')  # phase / state space
     axs[1].set_xlabel('x position, $ x $ (km)')
     axs[1].set_ylabel('y position, $ y $ (km)')
     axs[1].set_title('Trajectory')
     axs[1].legend(loc="upper right")
+
+    # error vs circle
     axs[2].plot(t / 60, errors_kepler)
     axs[2].set_xlabel('Time, $ t $ (min)')
     axs[2].set_ylabel('Error, $ E $ (mm)')
-    axs[2].set_title('Error drift')
+    axs[2].set_title('Error drift relative to Kepler solution')
     plt.show()
+
+
+if __name__ == '__main__':
+    main()
