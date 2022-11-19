@@ -1,15 +1,23 @@
+# external libs
 import numpy as np
 from numpy.linalg import norm
 from scipy.integrate import odeint
 from scipy.optimize import root_scalar
 from matplotlib import pyplot as plt
 
+# built-in libs
+import gc
 
-GM = 398600.4415  # (km^3 / s^2)
+
+GM = 398600.4415  # parameter mu = graviational constant * mass of Earth (km^3 / s^2)
+
+np.set_printoptions(precision=16)  # for high precision debugging
 
 
+# FIXME: currently 30x worse error and 8x slower than matlab
 def gauss_jackson_8(ode_sys: callable, y_0: np.ndarray, dy_0: np.ndarray,
-        t_range: np.ndarray, dt: float, conv_max_iter: int = 10) -> tuple[np.ndarray]:
+        t_range: np.ndarray, dt: float, conv_max_iter: int = 10,
+        rel_tol: float = 1e-13, abs_tol: float = 1e-15) -> tuple[np.ndarray]:
     '''
     Integrates a system of second-order differential equations
     using the Gauss-Jackson 8th-order method.
@@ -28,17 +36,23 @@ def gauss_jackson_8(ode_sys: callable, y_0: np.ndarray, dy_0: np.ndarray,
     `dt` (float): constant step size in time at each iteration
 
     #### Optional Keyword Arguments
-    `conv_max_iter` (int, default = 100): max number of iterations to try converging predictions
+
+    `conv_max_iter` (int, default = 10): max number of iterations to try converging predictions
+
+    `abs_tol` (float, default = 1e-15): absolute tolerance for convergence
+
+    `rel_tol` (float, default = 1e-13): relative tolerance for convergence
     
     #### Returns
     
     tuple[np.ndarray]: the arrays (t, y, dy, ddy) representing the complete record of times,
-    position, velocity and acceleration respectively. They are sorted by row in time.
+    position, velocity and acceleration respectively. They are sorted by row in time such that
+    e.g. `y[n, i]` is the ith position ordinate at time step n.
     
     #### Raises
     
     `RuntimeError`: if the algorithm to refine the start-up accelerations fails to converge.
-    This has never happened in testing, so good luck if you hit it!
+    Try increasing `abs_tol` and/or `rel_tol` from their default values.
 
     #### Examples
 
@@ -106,9 +120,9 @@ def gauss_jackson_8(ode_sys: callable, y_0: np.ndarray, dy_0: np.ndarray,
 
     # calculate four times forward and backward using a lower-order integrator (RK4 or something)
     state_startup_forward = odeint(first_order_system, np.hstack((y_0, dy_0)),
-        np.linspace(t_start, t_start + 4 * dt, 5), tfirst=True)
+        np.linspace(t_start, t_start + 4 * dt, 5), tfirst=True, rtol=rel_tol, atol=abs_tol)
     state_startup_backward = odeint(first_order_system, np.hstack((y_0, dy_0)),
-        np.linspace(t_start, t_start - 4 * dt, 5), tfirst=True)
+        np.linspace(t_start, t_start - 4 * dt, 5), tfirst=True, rtol=rel_tol, atol=abs_tol)
 
     state_startup = np.vstack((state_startup_backward[::-1], state_startup_forward[1:]))
 
@@ -129,7 +143,7 @@ def gauss_jackson_8(ode_sys: callable, y_0: np.ndarray, dy_0: np.ndarray,
     iteration = 0
     old_acc = ddy  # use old_acc as the old acc, ddy as the new acc
     # while accelerations have not converged...
-    while (not np.allclose(old_acc, ddy) or iteration == 0) \
+    while (not np.allclose(old_acc, ddy, rtol=rel_tol, atol=abs_tol) or iteration == 0) \
             and (iteration < conv_max_iter):
 
         iteration += 1
@@ -173,77 +187,91 @@ def gauss_jackson_8(ode_sys: callable, y_0: np.ndarray, dy_0: np.ndarray,
         if iteration == conv_max_iter:
             raise RuntimeError('Failed to converge the start-up accelerations.')
 
-    # VERIFIED UP TO HERE: converged startup state is correct
+    # Verified up to here: start-up values correct to ~1 nm (identical to Matlab within ~1e-14 = 0.01 nm)
 
     # at this point we have a full set of accurate (y, dy, ddy) for n = (-4, -3, ..., 3, 4)
     # we are now at time n = 4 (from epoch) or equivalently i = 8 (from first calculation)
     n = 4  # index as written in the paper
     i = 8  # corresponding index in our arrays
 
-    while t_start + n * dt < t_stop:
+    # initialise large arrays to zeroes
+    num_steps = round((t_stop - t_start) / dt)
+    extra_zeroes = np.zeros((num_steps - 4, 3))
+    y = np.vstack((y, extra_zeroes))           # y_n = y[i]
+    dy = np.vstack((dy, extra_zeroes))         # dy_n = dy[i]
+    ddy = np.vstack((ddy, extra_zeroes))       # ddy_n = ddy[i]
+    s = np.vstack((s, extra_zeroes))           # s_n = s[i]
+    S = np.vstack((S, extra_zeroes))           # S_n = S[i]
+    t = np.linspace(t_start - 4 * dt, t_start + num_steps * dt,
+        num_steps + 5)                         # t_n = t[i]
+
+    while t[i] < t_stop:
 
         ##############
         ## PREDICT: ##
         ##############
 
         # STEP 4: Calculate S_(n+1)
-        S = np.vstack((S, S[-1] + s[-1] + 1/2 * ddy[-1]))  # last row is S_(n+1)
-        S = S[-2:]  # discard older S to save memory
+        S[i + 1] = S[i] + s[i] + 1/2 * ddy[i]  # last row is S_(n+1)
 
         # STEP 5 and 6: Calculate sums
-        b_sum = sum([b[9, k] * ddy[n + k - 4] for k in k_ind])
-        a_sum = sum([a[9, k] * ddy[n + k - 4] for k in k_ind])
+        b_sum = sum([b[9, k] * ddy[i - 8 + k] for k in k_ind])
+        a_sum = sum([a[9, k] * ddy[i - 8 + k] for k in k_ind])
 
         # STEP 7: Calculate dy and y
-        dy = np.vstack((dy, dt * (s[-1] + 1/2 * ddy[-1] + b_sum)))
-        y = np.vstack((y, dt ** 2 * (S[-1] + a_sum)))
+        dy[i + 1] = dt * (s[i] + 1/2 * ddy[i] + b_sum)
+        y[i + 1] = dt ** 2 * (S[i + 1] + a_sum)
 
         #######################
         ## EVALUATE-CORRECT: ##
         #######################
 
         # STEP 8: Calculate ddy_(n+1) using force model
-        ddy = np.vstack((ddy, ode_sys(t_start + dt * (n + 1), y[-1], dy[-1])))
+        ddy[i + 1] = ode_sys(t[i + 1], y[i + 1], dy[i + 1])
 
         # STEP 9: Increment n
         n += 1
         i += 1
 
         # STEP 10: Refine position and velocity
-        old_y, old_dy = y[-1], dy[-1]
-        its = 0  # iteration number
-        while not (np.allclose(old_y, y[-1]) or np.allclose(old_dy, dy[-1])) \
-                or its == 0 and its < conv_max_iter:
+        old_y, old_dy = y[i], dy[i]
+        iteration = 0  # iteration number
+        while not (np.allclose(old_y, y[i], rtol=rel_tol, atol=abs_tol) and \
+                np.allclose(old_dy, dy[i], rtol=rel_tol, atol=abs_tol)) \
+                or iteration == 0 and iteration < conv_max_iter:
 
-            its += 1
-            old_y, old_dy = y[-1], dy[-1]
+            iteration += 1
+            old_y, old_dy = y[i], dy[i]
 
             # calculate s_n
-            s = np.vstack((s, s[-1] + 1/2 * (ddy[-2] + ddy[-1])))
-            s = s[-2:]  # discard older s to save memory
+            s[i] = s[i - 1] + 1/2 * (ddy[i - 1] + ddy[i])
 
             # calculate sums
-            if its == 1:
-                b_sum = sum([b[8, k] * ddy[n + k - 4] for k in k_ind[:-1]])
-                a_sum = sum([a[8, k] * ddy[n + k - 4] for k in k_ind[:-1]])
+            if iteration == 1:
+                b_sum = sum([b[8, k] * ddy[i - 8 + k] for k in k_ind[:-1]])
+                a_sum = sum([a[8, k] * ddy[i - 8 + k] for k in k_ind[:-1]])
 
             # calculate last terms (only these change)
-            b_sum_last = b[8, 8] * ddy[-1]
-            a_sum_last = a[8, 8] * ddy[-1]
+            b_sum_last = b[8, 8] * ddy[i]
+            a_sum_last = a[8, 8] * ddy[i]
 
             # calculate new y and dy
-            dy[-1] = dt * (s[-1] + b_sum + b_sum_last)
-            y[-1] = dt ** 2 * (S[-1] + a_sum + a_sum_last)
+            dy[i] = dt * (s[i] + b_sum + b_sum_last)
+            y[i] = dt ** 2 * (S[i] + a_sum + a_sum_last)
 
         else:
             # check convergence
-            if iteration == 100:
+            if iteration == conv_max_iter:
                 raise RuntimeError('Failed to converge the start-up accelerations.')
 
     # All done with iteration - remove pre-epoch parts of arrays
-    y, dy, ddy = y[4:], dy[4:], ddy[4:]
-    num_steps = len(y) - 1
-    t = np.linspace(t_start, t_start + num_steps * dt, num_steps + 1)
+    t, y, dy, ddy = t[4:], y[4:], dy[4:], ddy[4:]
+    
+    # clear s and S from memory
+    del s, S
+    gc.collect()
+
+    # return
     return (t, y, dy, ddy)
 
 
@@ -303,8 +331,12 @@ def calculate_kepler_orbit(r_0: np.ndarray, v_0: np.ndarray, t_vec: np.ndarray) 
     v_calc = np.reshape(np.zeros_like(t_vec), (t_vec.shape[0], 1)) * np.zeros_like(v_0)
     a_calc = np.reshape(np.zeros_like(t_vec), (t_vec.shape[0], 1)) * np.zeros_like(v_0)
 
-    C = lambda z: (1 - np.cos(np.sqrt(z))) / z if z != 0 else 1/2            # Stumpff functions
-    S = lambda z: ((p := np.sqrt(z)) - np.sin(p)) / p ** 3 if z != 0 else 1/6
+    # Stumpff functions
+    C = lambda z: (1 - np.cos(np.sqrt(z))) / z if z > 0 else \
+        ((1 - np.cosh(np.sqrt(-z))) / z if z < 0 else 1/2)
+    S = lambda z: ((p := np.sqrt(z)) - np.sin(p)) / p ** 3 if z > 0 else \
+        ((np.sinh((p := np.sqrt(-z))) - p) / p ** 3 if z < 0 else 1/6)
+    # derivatives of C(z) and S(z)
     dCdz = lambda z: 1 / (2 * z) * (1 - 2 * C(z) - z * S(z))
     dSdz = lambda z: 1 / (2 * z) * (C(z) - 3 * S(z))
 
@@ -315,11 +347,13 @@ def calculate_kepler_orbit(r_0: np.ndarray, v_0: np.ndarray, t_vec: np.ndarray) 
         F_chi = lambda x: np.sqrt(GM) * dt - (r_0m * v_r0) / np.sqrt(GM) * x ** 2 * C(alpha * x ** 2) \
             - (1 - alpha * r_0m) * x ** 3 * S(alpha * x ** 2) - r_0m * x
 
+        # derivative of F_chi wrt chi
         dF_chi = lambda x: -(2 * (r_0m * v_r0) / np.sqrt(GM) * x * C(alpha * x ** 2) + \
             (r_0m * v_r0) / np.sqrt(GM) * x ** 2 * 2 * alpha * x * dCdz(alpha * x ** 2)) - \
-            (3 * x ** 2 * (1 - alpha * r_0m) * S(alpha * x ** 2) + (1 - alpha * r_0m) * x ** 3 * 2 * alpha * x * dSdz(alpha * x ** 2)) - r_0m
+            (3 * x ** 2 * (1 - alpha * r_0m) * S(alpha * x ** 2) + \
+            (1 - alpha * r_0m) * x ** 3 * 2 * alpha * x * dSdz(alpha * x ** 2)) - r_0m
 
-        CHI = root_scalar(F_chi, x0=CHI_0, fprime=dF_chi, method='newton').root
+        CHI = root_scalar(F_chi, x0=CHI_0, fprime=dF_chi, method='newton', xtol=1e-15, rtol=1e-13).root
 
         f = 1 - CHI ** 2 / r_0m * C(alpha * CHI ** 2)               # Lagrange coefficients
         g = dt - (GM) ** (-1/2) * CHI ** 3 * S(alpha * CHI ** 2)
@@ -343,24 +377,37 @@ if __name__ == '__main__':
     R_0 = 7000                          # 7000 km
     V_0 = np.sqrt(GM / R_0)             # choose the speed for a circular orbit: 7.546053290107541 km/s
 
-    # calculate trajectory
+    # calculate trajectory using GJ8
     print('Calculating trajectory using GJ8...')
-    t, r, dr, ddr = gauss_jackson_8(orbital_dynamics,
-        np.array([R_0, 0, 0]), np.array([0, V_0, 0]), (0, 86400 / 2), 10)
+    t, r, *_ = gauss_jackson_8(orbital_dynamics,
+        np.array([R_0, 0, 0]), np.array([0, V_0, 0]), (0, 8640000 / 2), 60)
 
-    # calculate better known position
+    # calculate circular orbit position
+    print('Calculating trajectory using circular motion...')
+    W = norm(V_0) / norm(R_0)
+    r_circle = np.array([[R_0 * np.cos(W * t_i), R_0 * np.sin(W * t_i), 0] for t_i in t])
+    errors_circle = [1e6 * np.hypot(r_circle[i, 0] - r[i, 0], r_circle[i, 1] - r[i, 1]) \
+        for i in range(len(r))]
+
+    # calculate orbit with Kepler's equation
     print('Calculating trajectory using Kepler equation...')
-    r_ex, _v_ex, _a_ex = calculate_kepler_orbit(np.array([R_0, 0, 0]), np.array([0, V_0, 0]), t)
-    errors = [1e6 * np.hypot(r_ex[i, 0] - r[i, 0], r_ex[i, 1] - r[i, 1]) for i in range(len(r))]
+    r_kepler, _v_k, _a_k = calculate_kepler_orbit(np.array([R_0, 0, 0]), np.array([0, V_0, 0]), t)
+    errors_kepler = [1e6 * np.hypot(r_kepler[i, 0] - r[i, 0], r_kepler[i, 1] - r[i, 1]) \
+        for i in range(len(r))]
+
+    # check kepler actually works (it does, to < 1 micron)
+    kepler_vs_circle = [1e6 * np.hypot(r_kepler[i, 0] - r_circle[i, 0], r_kepler[i, 1] - r_circle[i, 1]) \
+        for i in range(len(r))]
+
 
     # plots
     print('Plotting graphs...')
     fig, axs = plt.subplots(1, 3, figsize=(12, 4))
     fig.suptitle('Gauss-Jackson Orbit Propogation Results')
     fig.tight_layout(pad=3)
-    axs[0].plot(t, r[:, 0], label='$ x(t) $')  # x(t)
-    axs[0].plot(t, r[:, 1], label='$ y(t) $')  # y(t)
-    axs[0].set_xlabel('Time, $ t $ (s)')
+    axs[0].plot(t / 60, r[:, 0], label='$ x(t) $')  # x(t)
+    axs[0].plot(t / 60, r[:, 1], label='$ y(t) $')  # y(t)
+    axs[0].set_xlabel('Time, $ t $ (min)')
     axs[0].set_ylabel('Position, $ \mathbf{r} $ (km)')
     axs[0].set_title('Position components')
     axs[1].plot(r[:, 0], r[:, 1], label='calculated')  # phase / state space
@@ -368,8 +415,8 @@ if __name__ == '__main__':
     axs[1].set_ylabel('y position, $ y $ (km)')
     axs[1].set_title('Trajectory')
     axs[1].legend(loc="upper right")
-    axs[2].plot(t, errors)
-    axs[2].set_xlabel('Time, $ t $ (s)')
+    axs[2].plot(t / 60, errors_kepler)
+    axs[2].set_xlabel('Time, $ t $ (min)')
     axs[2].set_ylabel('Error, $ E $ (mm)')
     axs[2].set_title('Error drift')
     plt.show()
